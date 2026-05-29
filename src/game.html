@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>AI2ORBIT Football AI</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0D3B0F; color: white; font-family: 'Courier New', monospace; overflow: hidden; height: 100vh; display: flex; flex-direction: column; }
+.pad { padding: 8px; flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.header { display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
+.score { font-size: 20px; font-weight: bold; }
+.time { font-size: 16px; font-weight: bold; }
+.field-wrap { position: relative; margin: 3px 0; flex-shrink: 0; }
+canvas { width: 100%; display: block; border: 2px solid rgba(255,255,255,0.5); }
+.prediction { background: #1A237E; color: #FFFF00; font-weight: bold; text-align: center; padding: 4px 8px; font-size: 13px; display: none; flex-shrink: 0; }
+.prediction.correct { background: #1B5E20; }
+.prediction.wrong { background: #B71C1C; }
+.info { font-size: 11px; padding: 1px 0; flex-shrink: 0; }
+.info-row { display: flex; justify-content: space-between; }
+.stats { font-size: 10px; color: #ccc; padding: 1px 0; flex-shrink: 0; }
+.cost-box { background: #0A0A2E; padding: 6px; font-size: 10px; color: #ccc; margin: 3px 0; line-height: 1.35; border: 1px solid #1A1A4E; flex-shrink: 0; }
+.cost-title { color: #FFFF00; font-weight: bold; }
+.cost-total { color: #00FF00; font-weight: bold; }
+.log-label { font-size: 11px; font-weight: bold; padding: 2px 0 1px; flex-shrink: 0; }
+.log { font-size: 10px; color: #ccc; line-height: 1.4; overflow-y: auto; flex: 1; min-height: 0; }
+.copyright { font-size: 9px; color: #444; text-align: center; padding: 2px 0; flex-shrink: 0; }
+</style>
+</head><body>
+<div class="pad">
+  <div class="header">
+    <span class="score" id="score">HOME 0 - 0 AWAY</span>
+    <span class="time" id="time">00:00</span>
+  </div>
+  <div class="field-wrap">
+    <canvas id="field" width="440" height="260"></canvas>
+  </div>
+  <div class="prediction" id="prediction"></div>
+  <div class="info info-row">
+    <span id="possession">Ball: HOME [5.0, 4.0]</span>
+    <span id="movement">Forward Center (#0/44)</span>
+  </div>
+  <div class="stats" id="formation">Behind: H=4 A=4 | Front: H=6 A=6 | Subs H:0 A:0</div>
+  <div class="stats" id="timing">Tap: 0.000s | Motion: 0.00s | Exh H:0% A:0%</div>
+  <div class="stats" id="probability">Win: HOME 50% - AWAY 50%</div>
+  <div class="stats" id="bounce">Bounce: HOME 0.000 (0) | AWAY 0.000 (0)</div>
+  <div class="stats" id="rule50505">50505: 5min=0 0evt=0 5try=0 0mis=0 5hom=0</div>
+  <div class="stats" id="statsLine">OFF:0 COR:0 GK:0 FK:0 TI:0 | Loop 1/8</div>
+  <div class="cost-box" id="costBox">
+    <span class="cost-title">--- Cost Analysis ---</span><br>
+    Loading...
+  </div>
+  <div class="log-label">--- Events ---</div>
+  <div class="log" id="eventLog"></div>
+  <div class="copyright">Copyright &copy; AI2ORBIT Co. All rights reserved.</div>
+</div>
+
+<script>
+const { ipcRenderer } = require('electron');
+
+const GRID_LENGTH = 10, GRID_WIDTH = 8;
+const MOVEMENT_NAMES = [
+  "Forward Center","Forward Left","Forward Right","Left Wing","Right Wing",
+  "Back Pass","Back Left","Back Right","Long Ball","Cross Left","Cross Right",
+  "Through Ball","Lob","Chip","Ground Pass","One-Two","Dribble Fwd",
+  "Dribble Left","Dribble Right","Shot Low","Shot High","Shot Left",
+  "Shot Right","Header","Volley","Free Kick","Penalty","Throw In",
+  "Goal Kick Short","Goal Kick Long","Corner Short","Corner Long",
+  "Clearance","Tackle","Intercept","Deflection","Save Low","Save High",
+  "Punch","Distribute","Slide","Flick","Backheel","Uniform"
+];
+const FORCE_CONSTANT = 0.0023 * 0.0006998 * Math.pow(0.03, 1.001234);
+const TAP_MIN = 0.002, TAP_MAX = 0.5;
+const MOTION_SHORT_MIN = 0.08, MOTION_SHORT_MAX = 1.0;
+const MOTION_LONG_MIN = 3.0, MOTION_LONG_MAX = 6.0;
+
+// Cost constants
+const COST_PER_MINUTE = 1250.0, COST_PER_RUN_METER = 18.50;
+const COST_CORNER_BASE = 3200.0, COST_CORNER_RADIUS = 450.0;
+const COST_GOAL_EVENT = 8500.0, COST_OFFSIDE_EVENT = 1800.0;
+const COST_FREEKICK_EVENT = 2400.0, COST_THROWIN_EVENT = 900.0;
+const COST_GOALKICK_EVENT = 1600.0, COST_SUBSTITUTION = 1200.0;
+const COST_PER_PLAYER_MIN = 85.0;
+
+const learnedOffsideRate = 0.12, learnedCornerRate = 0.25;
+const learnedGoalieKickRate = 0.18, learnedThrowRate = 0.30;
+
+let ballX=5,ballY=4, homeScore=0,awayScore=0, gameMinute=0, possession=0;
+let currentMovement=0, forceArrowLength=0, forceAngle=0;
+let ballTapTime=0, motionTime=0, isHalfTime=false, isFullTime=false;
+let gameRunning=false, loopCount=0, tickCount=0, homeProbability=50;
+let homeBehind=4,homeFront=6, awayBehind=4,awayFront=6;
+let homeSubstitutions=0,awaySubstitutions=0, homeExhaustion=0,awayExhaustion=0;
+let offsideCount=0,cornerCount=0,goalieKickCount=0,freeKickCount=0,throwInCount=0;
+let homeBounce=0,awayBounce=0, homeTouches=0,awayTouches=0;
+let rule5minPeriod=0,rule0events=0,rule5tries=0,rule0missed=0,rule5homies=0;
+let predictionMade=false, predictionText="", predictedWinner="";
+let predictedHomeGoals=0,predictedAwayGoals=0, predictionConfidence=0;
+let totalRunMeters=0,totalProductionCost=0,totalCornerCost=0,totalGoalCost=0;
+let totalEventCost=0,totalPlayerCost=0,homePlayerCost=0,awayPlayerCost=0;
+let totalGoalsForCost=0,costPerMinuteLive=0;
+let movementCosts=new Array(44).fill(0), movementCounts=new Array(44).fill(0);
+let costLog=[], eventLog=[];
+
+function footballHash(x, depth) {
+  let val = x;
+  for (let i = 0; i < depth; i++) {
+    val = Math.sin(val * 1.5 + i * 0.7 + x * 0.01) * Math.cos(val * 0.618);
+    val = Math.abs(val) * 0.3 + 0.25;
+  }
+  return val;
+}
+
+function scoreWord(g) {
+  return ["nil","one","two","three","four","five"][g] || String(g);
+}
+
+function selectMovement() {
+  let h = footballHash(ballX*10+ballY*5+homeBehind*3+homeFront*2, 6);
+  if ((possession===0&&ballX>8)||(possession===1&&ballX<2)) return 19+(Math.floor(h*20))%6;
+  if ((possession===0&&ballX<2)||(possession===1&&ballX>8)) return h>0.30?32+(Math.floor(h*8))%8:5;
+  if (ballY<1||ballY>7) return ballY<1?9:10;
+  let mid = Math.floor(h*43)%18;
+  let fwd = homeBehind/(homeBehind+homeFront+1);
+  if (fwd>0.5&&h>0.35) mid=11;
+  return mid;
+}
+
+function calculateForce(mvId, behind, front) {
+  let fl=1/43, mf=(mvId<43)?(1+mvId*fl*0.5):1;
+  let pr=front>0?(1+behind)/(1+front):(1+behind);
+  let fm=behind>front?0.0044:0.0004;
+  let mm=behind>3?1.05:1.044;
+  return FORCE_CONSTANT*mf*pr*(1+fm)*mm;
+}
+
+function getMovementAngle(id) {
+  if (id<=2) return 90+(id-1)*15;
+  if (id<=4) return id===3?135:45;
+  if (id<=7) return 270+(id-5)*15;
+  if (id===8) return 90;
+  if (id<=11) return 60+(id-9)*20;
+  if (id<=18) return 30+id*8;
+  if (id<=24) return 85+(id-19)*2;
+  if (id<=31) return 70+(id-25)*10;
+  if (id<=39) return 200+(id-32)*15;
+  if (id<=42) return 45+(id-40)*30;
+  return footballHash(id*7.7,3)*360;
+}
+
+function addEvent(s) { eventLog.push(s); if (eventLog.length>200) eventLog.shift(); }
+
+function resetMatch() {
+  ballX=5;ballY=4;homeScore=0;awayScore=0;gameMinute=0;possession=0;
+  isHalfTime=false;isFullTime=false;tickCount=0;
+  offsideCount=0;cornerCount=0;goalieKickCount=0;freeKickCount=0;throwInCount=0;
+  homeBounce=0;awayBounce=0;homeTouches=0;awayTouches=0;
+  homeExhaustion=0;awayExhaustion=0;homeSubstitutions=0;awaySubstitutions=0;
+  rule5minPeriod=0;rule0events=0;rule5tries=0;rule0missed=0;rule5homies=0;
+  homeProbability=50;predictionMade=false;predictionText="";
+  totalRunMeters=0;totalProductionCost=0;totalCornerCost=0;totalGoalCost=0;
+  totalEventCost=0;totalPlayerCost=0;homePlayerCost=0;awayPlayerCost=0;
+  totalGoalsForCost=0;costPerMinuteLive=0;
+  movementCosts=new Array(44).fill(0);movementCounts=new Array(44).fill(0);
+}
+
+function simulateTick() {
+  tickCount++;
+  gameMinute = (90*tickCount)/180;
+
+  if (gameMinute>=45&&!isHalfTime&&gameMinute<46) {
+    isHalfTime=true;
+    addEvent(`${String(Math.floor(gameMinute)).padStart(2,'0')}' --- HALF TIME --- ${homeScore}-${awayScore}`);
+  }
+  if (tickCount>=180) {
+    isFullTime=true;
+    let result = homeScore>awayScore?"HOME WINS":awayScore>homeScore?"AWAY WINS":"DRAW";
+    addEvent(`90' --- FULL TIME --- ${homeScore}-${awayScore} (${result})`);
+    addEvent(`Score: ${scoreWord(homeScore)} - ${scoreWord(awayScore)}`);
+    if (predictionMade) {
+      let actual = homeScore>awayScore?"HOME":awayScore>homeScore?"AWAY":"DRAW";
+      addEvent(`Prediction was: ${predictedWinner} ${predictedHomeGoals}-${predictedAwayGoals} -> ${actual===predictedWinner?"CORRECT!":"WRONG"}`);
+    }
+    return;
+  }
+
+  let possHash = footballHash(tickCount*1.3+loopCount*100, 5);
+  possession = possHash>0.45?0:1;
+
+  let behindPatterns = [1,6,7,8];
+  let formHash = Math.abs(Math.sin(tickCount*0.1+loopCount*0.5));
+  homeBehind = behindPatterns[Math.floor(formHash*4)%4];
+  homeFront = 10-homeBehind;
+  let formHash2 = Math.abs(Math.cos(tickCount*0.1+loopCount*0.3));
+  awayBehind = behindPatterns[Math.floor(formHash2*4)%4];
+  awayFront = 10-awayBehind;
+
+  currentMovement = selectMovement();
+  let behind = possession===0?homeBehind:awayBehind;
+  let front = possession===0?homeFront:awayFront;
+  let force = calculateForce(currentMovement, behind, front);
+
+  ballTapTime = TAP_MIN+footballHash(tickCount*4.1,3)*(TAP_MAX-TAP_MIN);
+  let isFullMotion = currentMovement===8||currentMovement===12||currentMovement===13||(currentMovement>=25&&currentMovement<=31);
+  motionTime = isFullMotion
+    ? MOTION_LONG_MIN+footballHash(tickCount*2.5,4)*(MOTION_LONG_MAX-MOTION_LONG_MIN)
+    : MOTION_SHORT_MIN+footballHash(tickCount*2.5,4)*(MOTION_SHORT_MAX-MOTION_SHORT_MIN);
+
+  let direction = possession===0?1:-1;
+  let step = footballHash(tickCount*3.3+loopCount*7,4)*0.6;
+  let xBias=0, yBias=0;
+  if (currentMovement<=4||currentMovement===8||currentMovement===11||currentMovement===16) xBias=1;
+  else if (currentMovement>=19&&currentMovement<=24) xBias=1.5;
+  else if (currentMovement>=5&&currentMovement<=7) xBias=-0.5;
+  else if (currentMovement>=32&&currentMovement<=39) xBias=-0.8;
+  else xBias=0.3;
+  if (currentMovement===3||currentMovement===9||currentMovement===17) yBias=-0.5;
+  else if (currentMovement===4||currentMovement===10||currentMovement===18) yBias=0.5;
+
+  ballX+=xBias*step*direction; ballY+=yBias*step;
+  ballX=Math.max(0,Math.min(GRID_LENGTH,ballX)); ballY=Math.max(0,Math.min(GRID_WIDTH,ballY));
+
+  forceAngle = getMovementAngle(currentMovement)*direction;
+  forceArrowLength = force*1e7+step*30;
+
+  let bounceVal = footballHash(tickCount*2.1+currentMovement*0.7, 4);
+  if (possession===0) { homeBounce+=bounceVal; homeTouches++; }
+  else { awayBounce+=bounceVal; awayTouches++; }
+
+  homeExhaustion+=0.002+(possession===0?0.003:0.001);
+  awayExhaustion+=0.002+(possession===1?0.003:0.001);
+
+  if (homeExhaustion>0.7&&homeSubstitutions<5) {
+    homeSubstitutions++; homeExhaustion*=0.6; totalEventCost+=COST_SUBSTITUTION;
+    addEvent(`${String(Math.floor(gameMinute)).padStart(2,'0')}' HOME sub #${homeSubstitutions} (fatigue)`);
+    costLog.push(`${gameMinute.toFixed(1)},SUBSTITUTION,HOME,${COST_SUBSTITUTION.toFixed(2)}`);
+  }
+  if (awayExhaustion>0.7&&awaySubstitutions<5) {
+    awaySubstitutions++; awayExhaustion*=0.6; totalEventCost+=COST_SUBSTITUTION;
+    addEvent(`${String(Math.floor(gameMinute)).padStart(2,'0')}' AWAY sub #${awaySubstitutions} (fatigue)`);
+    costLog.push(`${gameMinute.toFixed(1)},SUBSTITUTION,AWAY,${COST_SUBSTITUTION.toFixed(2)}`);
+  }
+
+  let currentPeriod = Math.floor(gameMinute/5);
+  if (currentPeriod>rule5minPeriod) { rule5minPeriod=currentPeriod; rule0events=0;rule5tries=0;rule0missed=0;rule5homies=0; }
+
+  let eventHash = footballHash(tickCount*3.7+loopCount*50, 5);
+  let eventRoll = footballHash(tickCount*7.3+loopCount*30, 4);
+  let mm = Math.floor(gameMinute);
+  let mp = String(mm).padStart(2,'0');
+
+  if (eventHash>0.48&&currentMovement>=19&&currentMovement<=24) {
+    rule5tries++;
+    let goalChance = footballHash(tickCount*5+loopCount*20, 7);
+    let inZone = (possession===0&&ballX>7)||(possession===1&&ballX<3);
+    if (inZone&&goalChance>0.40) {
+      if (possession===0) homeScore++; else awayScore++;
+      totalGoalsForCost++; totalGoalCost+=COST_GOAL_EVENT; totalEventCost+=COST_GOAL_EVENT;
+      let team = possession===0?"HOME":"AWAY";
+      addEvent(`${mp}' GOAL! ${team} (${homeScore}-${awayScore}) [${MOVEMENT_NAMES[currentMovement]} F=${force.toExponential(2)} tap=${ballTapTime.toFixed(3)}s]`);
+      costLog.push(`${gameMinute.toFixed(1)},GOAL,${team},${COST_GOAL_EVENT.toFixed(2)}`);
+      ballX=5;ballY=4;
+    } else {
+      rule0missed++;
+      addEvent(`${mp}' ${possession===0?"HOME":"AWAY"} shot (${MOVEMENT_NAMES[currentMovement]}) - missed`);
+    }
+  } else if (eventRoll<learnedOffsideRate+0.04) {
+    offsideCount++; rule0events++; totalEventCost+=COST_OFFSIDE_EVENT;
+    let team=possession===0?"HOME":"AWAY";
+    addEvent(`${mp}' Offside - ${team} (#${offsideCount}) [${ballTapTime.toFixed(3)}s]`);
+    costLog.push(`${gameMinute.toFixed(1)},OFFSIDE,${team},${COST_OFFSIDE_EVENT.toFixed(2)}`);
+    ballX+=(possession===0?-1.5:1.5); ballX=Math.max(0,Math.min(GRID_LENGTH,ballX));
+  } else if (eventRoll<learnedOffsideRate+learnedCornerRate+0.04) {
+    cornerCount++; rule0events++;
+    let cornerRadius=footballHash(tickCount*2.3,3)*5+1;
+    let cCost=COST_CORNER_BASE+cornerRadius*COST_CORNER_RADIUS;
+    totalCornerCost+=cCost; totalEventCost+=cCost;
+    let team=possession===0?"HOME":"AWAY";
+    addEvent(`${mp}' Corner - ${team} (#${cornerCount}) [motion ${motionTime.toFixed(1)}s r=${cornerRadius.toFixed(1)} $${Math.floor(cCost)}]`);
+    costLog.push(`${gameMinute.toFixed(1)},CORNER,${team},${cCost.toFixed(2)},radius=${cornerRadius.toFixed(1)}`);
+    ballX=possession===0?9.5:0.5; ballY=footballHash(tickCount*1.1,3)>0.4?0.5:7.5;
+  } else if (eventRoll<learnedOffsideRate+learnedCornerRate+learnedGoalieKickRate+0.04) {
+    goalieKickCount++; rule0events++; totalEventCost+=COST_GOALKICK_EVENT;
+    let team=possession===0?"AWAY":"HOME";
+    addEvent(`${mp}' Goal kick - ${team} GK (air:2.1s #${goalieKickCount}) [motion ${motionTime.toFixed(1)}s]`);
+    costLog.push(`${gameMinute.toFixed(1)},GOALKICK,${team},${COST_GOALKICK_EVENT.toFixed(2)}`);
+    ballX=possession===0?1:9; ballY=4;
+  } else if (eventRoll<learnedOffsideRate+learnedCornerRate+learnedGoalieKickRate+learnedThrowRate+0.04) {
+    throwInCount++; rule0events++; totalEventCost+=COST_THROWIN_EVENT;
+    let team=possession===0?"HOME":"AWAY";
+    addEvent(`${mp}' Throw in - ${team} (#${throwInCount})`);
+    costLog.push(`${gameMinute.toFixed(1)},THROWIN,${team},${COST_THROWIN_EVENT.toFixed(2)}`);
+    ballY=ballY<4?0:8;
+  } else if (eventHash>0.33&&eventHash<=0.36) {
+    freeKickCount++; rule0events++; totalEventCost+=COST_FREEKICK_EVENT;
+    let team=possession===0?"HOME":"AWAY";
+    addEvent(`${mp}' Free kick - ${team}`);
+    costLog.push(`${gameMinute.toFixed(1)},FREEKICK,${team},${COST_FREEKICK_EVENT.toFixed(2)}`);
+  }
+
+  if (possession===0) rule5homies++;
+
+  // 1/3 prediction
+  if (!predictionMade&&gameMinute>=30) {
+    predictionMade=true;
+    let sf=90/30;
+    predictedHomeGoals=Math.round(homeScore*sf);
+    predictedAwayGoals=Math.round(awayScore*sf);
+    if (predictedHomeGoals===predictedAwayGoals&&homeProbability>50) predictedHomeGoals++;
+    else if (predictedHomeGoals===predictedAwayGoals&&homeProbability<50) predictedAwayGoals++;
+    predictedWinner=predictedHomeGoals>predictedAwayGoals?"HOME":predictedAwayGoals>predictedHomeGoals?"AWAY":"DRAW";
+    let hB=homeTouches>0?homeBounce/homeTouches:0.35;
+    let aB=awayTouches>0?awayBounce/awayTouches:0.35;
+    predictionConfidence=Math.min(95,40+Math.abs(homeScore-awayScore)*15+Math.abs(hB-aB)*50);
+    predictionText=`1/3 PREDICTION: ${predictedWinner} wins (${predictedHomeGoals}-${predictedAwayGoals}) ${Math.floor(predictionConfidence)}% conf`;
+    addEvent(`30' >>> PREDICTION: ${predictedWinner} wins ${predictedHomeGoals}-${predictedAwayGoals} (${Math.floor(predictionConfidence)}% confidence) <<<`);
+  }
+
+  if (ballY<0.8) ballY=1; else if (ballY>7.2) ballY=7;
+
+  let homeAdv=(homeScore-awayScore)*15, possAdv=possession===0?3:-3, bounceAdv=0;
+  if (homeTouches>0&&awayTouches>0) bounceAdv=((homeBounce/homeTouches)-(awayBounce/awayTouches))*20;
+  homeProbability=Math.max(2,Math.min(98,50+homeAdv+possAdv+bounceAdv));
+
+  // Cost tracking
+  let runDist=Math.sqrt(xBias*xBias+yBias*yBias)*step*10.5;
+  totalRunMeters+=runDist;
+  let tickProdCost=COST_PER_MINUTE*(90/180);
+  totalProductionCost+=tickProdCost;
+  let moveCost=tickProdCost+runDist*COST_PER_RUN_METER;
+  if (currentMovement>=0&&currentMovement<44) { movementCosts[currentMovement]+=moveCost; movementCounts[currentMovement]++; }
+  let playerMinCost=COST_PER_PLAYER_MIN*22*(90/180);
+  totalPlayerCost+=playerMinCost;
+  if (possession===0) homePlayerCost+=playerMinCost*0.6; else awayPlayerCost+=playerMinCost*0.6;
+  homePlayerCost+=playerMinCost*0.2; awayPlayerCost+=playerMinCost*0.2;
+  costPerMinuteLive=gameMinute>0?(totalProductionCost+totalEventCost+totalRunMeters*COST_PER_RUN_METER)/gameMinute:0;
+}
+
+function exportCostData() {
+  let total=totalProductionCost+totalEventCost+totalRunMeters*COST_PER_RUN_METER+totalPlayerCost;
+  let csv = "minute,event_type,team,cost,extra\n";
+  costLog.forEach(l => csv+=l+"\n");
+  csv+=`\n# Summary\nproduction_cost,${totalProductionCost.toFixed(2)}\n`;
+  csv+=`run_meters,${Math.floor(totalRunMeters)}\nrun_cost,${(totalRunMeters*COST_PER_RUN_METER).toFixed(2)}\n`;
+  csv+=`event_cost,${totalEventCost.toFixed(2)}\nplayer_cost,${totalPlayerCost.toFixed(2)}\ntotal_cost,${total.toFixed(2)}\n`;
+
+  let obj = {
+    ai2orbit_football_cost: {
+      version: "1.0.1",
+      production_cost: +totalProductionCost.toFixed(2),
+      run_meters: Math.floor(totalRunMeters),
+      run_cost: +(totalRunMeters*COST_PER_RUN_METER).toFixed(2),
+      event_cost: +totalEventCost.toFixed(2),
+      goal_cost: +totalGoalCost.toFixed(2),
+      corner_cost: +totalCornerCost.toFixed(2),
+      player_cost: +totalPlayerCost.toFixed(2),
+      home_player_cost: +homePlayerCost.toFixed(2),
+      away_player_cost: +awayPlayerCost.toFixed(2),
+      total_cost: +total.toFixed(2),
+      cost_per_minute: +costPerMinuteLive.toFixed(2),
+      movement_costs: MOVEMENT_NAMES.map((n,i) => ({id:i,name:n,count:movementCounts[i],cost:+movementCosts[i].toFixed(2)})),
+      events: costLog.map(l => { let p=l.split(","); return {minute:+p[0],type:p[1]||"",team:p[2]||"",cost:+(p[3]||0)}; })
+    }
+  };
+  ipcRenderer.send('export-cost', { csv, json: JSON.stringify(obj, null, 2) });
+  addEvent("Cost data exported to Documents folder (JSON+CSV)");
+}
+
+ipcRenderer.on('export-done', (e, paths) => {
+  addEvent("Saved: " + paths.csvPath);
+  addEvent("Saved: " + paths.jsonPath);
+});
+
+// Drawing
+const canvas = document.getElementById('field');
+const ctx = canvas.getContext('2d');
+
+function drawField() {
+  let w=canvas.width, h=canvas.height, m=20;
+  let cW=(w-2*m)/GRID_LENGTH, cH=(h-2*m)/GRID_WIDTH;
+
+  ctx.fillStyle='#1B5E20'; ctx.fillRect(m,m,w-2*m,h-2*m);
+  ctx.strokeStyle='rgba(255,255,255,0.5)'; ctx.lineWidth=2;
+  ctx.strokeRect(m,m,w-2*m,h-2*m);
+
+  ctx.strokeStyle='rgba(255,255,255,0.15)'; ctx.lineWidth=1;
+  for(let i=1;i<GRID_LENGTH;i++){ctx.beginPath();ctx.moveTo(m+i*cW,m);ctx.lineTo(m+i*cW,h-m);ctx.stroke();}
+  for(let j=1;j<GRID_WIDTH;j++){ctx.beginPath();ctx.moveTo(m,m+j*cH);ctx.lineTo(w-m,m+j*cH);ctx.stroke();}
+
+  ctx.strokeStyle='rgba(255,255,255,0.5)'; ctx.lineWidth=2;
+  let cx=m+5*cW;
+  ctx.beginPath();ctx.moveTo(cx,m);ctx.lineTo(cx,h-m);ctx.stroke();
+  ctx.beginPath();ctx.arc(cx,m+4*cH,cH*1.2,0,Math.PI*2);ctx.stroke();
+
+  ctx.strokeStyle='rgba(255,255,255,0.7)'; ctx.lineWidth=3;
+  let gW=cW*0.3,gT=m+2.5*cH,gB=m+5.5*cH;
+  ctx.strokeRect(m-gW,gT,gW,gB-gT);ctx.strokeRect(w-m,gT,gW,gB-gT);
+
+  ctx.strokeStyle='rgba(255,255,255,0.5)';ctx.lineWidth=2;
+  let pW=cW*1.5,pT=m+1.5*cH,pB=m+6.5*cH;
+  ctx.strokeRect(m,pT,pW,pB-pT);ctx.strokeRect(w-m-pW,pT,pW,pB-pT);
+
+  // Ball
+  let bx=m+(ballX/GRID_LENGTH)*(w-2*m), by=m+(ballY/GRID_WIDTH)*(h-2*m);
+  ctx.fillStyle='white';ctx.beginPath();ctx.arc(bx,by,6,0,Math.PI*2);ctx.fill();
+
+  // Force arrow
+  if (forceArrowLength>0&&!isFullTime) {
+    let aLen=Math.min(forceArrowLength*2,cW*3);
+    let rad=forceAngle*Math.PI/180;
+    let ax=bx+Math.cos(rad)*aLen, ay=by-Math.sin(rad)*aLen;
+    ctx.strokeStyle='#FFFF00';ctx.lineWidth=3;
+    ctx.beginPath();ctx.moveTo(bx,by);ctx.lineTo(ax,ay);ctx.stroke();
+    let hs=8,h1=rad+Math.PI*0.8,h2=rad-Math.PI*0.8;
+    ctx.beginPath();ctx.moveTo(ax,ay);ctx.lineTo(ax+Math.cos(h1)*hs,ay-Math.sin(h1)*hs);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(ax,ay);ctx.lineTo(ax+Math.cos(h2)*hs,ay-Math.sin(h2)*hs);ctx.stroke();
+  }
+
+  ctx.fillStyle='rgba(255,255,255,0.4)';ctx.font='16px monospace';ctx.textAlign='center';
+  ctx.fillText("HOME",m+2.5*cW,h-4);ctx.fillText("AWAY",w-m-2.5*cW,h-4);
+  ctx.font='20px monospace';ctx.fillText(homeScore+" - "+awayScore,cx,m+cH*0.7);
+  ctx.font='11px monospace';ctx.fillText(Math.floor(gameMinute)+"'",cx,h-m-4);
+  if (currentMovement<MOVEMENT_NAMES.length&&!isFullTime)
+    ctx.fillText("#"+currentMovement+" "+MOVEMENT_NAMES[currentMovement],cx,m+cH*1.2);
+}
+
+function updateUI() {
+  document.getElementById('score').textContent=`HOME ${homeScore} - ${awayScore} AWAY`;
+  let mm=Math.floor(gameMinute),ss=Math.floor((gameMinute-mm)*60);
+  let ts=`${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
+  if (isHalfTime&&gameMinute<46) ts+=" HT";
+  if (isFullTime) ts="FT";
+  document.getElementById('time').textContent=ts;
+
+  let pred=document.getElementById('prediction');
+  if (predictionMade&&predictionText) {
+    pred.style.display='block';
+    if (isFullTime) {
+      let actual=homeScore>awayScore?"HOME":awayScore>homeScore?"AWAY":"DRAW";
+      let correct=actual===predictedWinner;
+      pred.textContent=predictionText+(correct?" - CORRECT!":" - WRONG");
+      pred.className="prediction "+(correct?"correct":"wrong");
+    } else { pred.textContent=predictionText; pred.className="prediction"; }
+  } else { pred.style.display='none'; }
+
+  let team=possession===0?"HOME":"AWAY";
+  document.getElementById('possession').textContent=`Ball: ${team} [${ballX.toFixed(1)}, ${ballY.toFixed(1)}]`;
+  document.getElementById('movement').textContent=`${MOVEMENT_NAMES[currentMovement]} (#${currentMovement}/44)`;
+  document.getElementById('formation').textContent=`Behind: H=${homeBehind} A=${awayBehind} | Front: H=${homeFront} A=${awayFront} | Subs H:${homeSubstitutions} A:${awaySubstitutions}`;
+  document.getElementById('timing').textContent=`Tap: ${ballTapTime.toFixed(3)}s | Motion: ${motionTime.toFixed(2)}s | Exh H:${Math.floor(homeExhaustion*100)}% A:${Math.floor(awayExhaustion*100)}%`;
+  document.getElementById('probability').textContent=`Win: HOME ${Math.floor(homeProbability)}% - AWAY ${Math.floor(100-homeProbability)}%`;
+  let hB=homeTouches>0?homeBounce/homeTouches:0, aB=awayTouches>0?awayBounce/awayTouches:0;
+  document.getElementById('bounce').textContent=`Bounce: HOME ${hB.toFixed(3)} (${homeTouches}) | AWAY ${aB.toFixed(3)} (${awayTouches})`;
+  document.getElementById('rule50505').textContent=`50505: 5min=${rule5minPeriod} 0evt=${rule0events} 5try=${rule5tries} 0mis=${rule0missed} 5hom=${rule5homies}`;
+  document.getElementById('statsLine').textContent=`OFF:${offsideCount} COR:${cornerCount} GK:${goalieKickCount} FK:${freeKickCount} TI:${throwInCount} | Loop ${loopCount+1}/8`;
+
+  // Cost display
+  let totalCost=totalProductionCost+totalEventCost+totalRunMeters*COST_PER_RUN_METER+totalPlayerCost;
+  let cb=document.getElementById('costBox');
+  cb.innerHTML=`<span class="cost-title">--- Cost Analysis ---</span><br>`+
+    `Production . . . : $${Math.floor(totalProductionCost).toLocaleString()}<br>`+
+    `Run meters . . . : ${Math.floor(totalRunMeters)}m ($${Math.floor(totalRunMeters*COST_PER_RUN_METER).toLocaleString()})<br>`+
+    `Events . . . . . : $${Math.floor(totalEventCost).toLocaleString()}<br>`+
+    `  Goals (${totalGoalsForCost}) . . : $${Math.floor(totalGoalCost).toLocaleString()}<br>`+
+    `  Corners. . . . : $${Math.floor(totalCornerCost).toLocaleString()}<br>`+
+    `Players (22) . . : $${Math.floor(totalPlayerCost).toLocaleString()}<br>`+
+    `  HOME . . . . . : $${Math.floor(homePlayerCost).toLocaleString()}<br>`+
+    `  AWAY . . . . . : $${Math.floor(awayPlayerCost).toLocaleString()}<br>`+
+    `<span class="cost-total">TOTAL. . . . . . : $${Math.floor(totalCost).toLocaleString()}</span><br>`+
+    `Cost/min . . . . : $${Math.floor(costPerMinuteLive).toLocaleString()}`;
+
+  let logEl=document.getElementById('eventLog');
+  let start=Math.max(0,eventLog.length-30);
+  logEl.textContent=eventLog.slice(start).join("\n");
+  logEl.scrollTop=logEl.scrollHeight;
+
+  drawField();
+}
+
+function gameLoop() {
+  if (!gameRunning) return;
+  if (isFullTime) {
+    loopCount++;
+    if (loopCount<8) {
+      addEvent("");addEvent(`=== LOOP ${loopCount+1}/8 - New Match ===`);
+      resetMatch();
+      setTimeout(gameLoop, 1000);
+    } else {
+      addEvent("");addEvent("=== ALL 8 LOOPS COMPLETE ===");
+      gameRunning=false;
+      exportCostData();
+      updateUI();
+    }
+    return;
+  }
+  simulateTick();
+  updateUI();
+  setTimeout(gameLoop, 300);
+}
+
+// Start
+gameRunning=true;
+resetMatch();
+addEvent("=== AI2ORBIT Football AI v1.0.1 ===");
+addEvent("Autonomous play - predicts winner at 1/3 (30')");
+addEvent(`F = 0.0023 * 0.0006998 * 0.03^1.001234`);
+addEvent("44 movements (43 + uniform)");
+addEvent(`Tap: ${TAP_MIN}-${TAP_MAX}s | Motion: ${MOTION_SHORT_MIN}-${MOTION_SHORT_MAX}s / ${MOTION_LONG_MIN}-${MOTION_LONG_MAX}s`);
+addEvent("Starting match 1/8...");
+setTimeout(gameLoop, 500);
+</script>
+</body></html>

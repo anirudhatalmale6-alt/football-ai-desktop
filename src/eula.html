@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>AI2ORBIT Football AI - License Agreement</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0D3B0F; color: white; font-family: 'Segoe UI', Arial, sans-serif; display: flex; flex-direction: column; height: 100vh; padding: 20px; }
+.header { text-align: center; padding: 15px 0; }
+.header img { width: 64px; height: 64px; }
+.header h1 { font-size: 22px; margin: 8px 0 2px; }
+.header p { font-size: 13px; color: #aaa; }
+.eula-box { flex: 1; background: #0A0A2E; border: 1px solid #1A1A4E; border-radius: 6px; padding: 15px; overflow-y: auto; margin: 12px 0; font-family: 'Courier New', monospace; font-size: 11px; color: #ccc; line-height: 1.5; white-space: pre-wrap; }
+.buttons { display: flex; gap: 12px; justify-content: center; padding: 10px 0; }
+.btn { padding: 10px 30px; border: none; border-radius: 4px; font-size: 14px; font-weight: bold; cursor: pointer; }
+.btn-accept { background: #1B5E20; color: white; }
+.btn-accept:hover { background: #2E7D32; }
+.btn-decline { background: #B71C1C; color: white; }
+.btn-decline:hover { background: #C62828; }
+.copyright { text-align: center; font-size: 11px; color: #666; padding-top: 6px; }
+</style>
+</head><body>
+<div class="header">
+  <img src="../assets/icon.png" alt="AI2ORBIT">
+  <h1>AI2ORBIT Football AI</h1>
+  <p>Version 1.0.1</p>
+</div>
+<div class="eula-box" id="eulaText"></div>
+<div class="buttons">
+  <button class="btn btn-decline" onclick="decline()">Decline</button>
+  <button class="btn btn-accept" onclick="accept()">I Accept</button>
+</div>
+<div class="copyright">Copyright &copy; AI2ORBIT Co. All rights reserved.</div>
+<script>
+const { ipcRenderer } = require('electron');
+const fs = require('fs');
+const path = require('path');
+const eulaPath = path.join(__dirname, '..', 'LICENSE.txt');
+document.getElementById('eulaText').textContent = fs.readFileSync(eulaPath, 'utf-8');
+function accept() { ipcRenderer.send('eula-accepted'); }
+function decline() { ipcRenderer.send('eula-declined'); }
+</script>
+</body></html>
