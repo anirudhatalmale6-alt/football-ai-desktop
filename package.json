@@ -1,14 +1,17 @@
 {
-  "name": "project",
-  "version": "1.0.0",
+  "name": "football-ai",
+  "version": "1.0.1",
   "description": "AI2ORBIT Football AI - Autonomous Football Simulation",
   "main": "src/main.js",
   "author": "AI2ORBIT Co.",
   "license": "UNLICENSED",
   "private": true,
   "scripts": {
-    "build": "node canary.js && tsc",
-    "prepare": "node canary.js"
+    "start": "electron .",
+    "build:win": "electron-builder --win",
+    "build:linux": "electron-builder --linux",
+    "build:mac": "electron-builder --mac",
+    "build:all": "electron-builder --win --linux --mac"
   },
   "build": {
     "appId": "com.ai2orbit.footballai",
